@@ -77,6 +77,7 @@ class SceneSplats:
         scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
         quats = torch.rand((N, 4))  # [N, 4]
         opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        aux_opacities = torch.logit(torch.full((N,), 0.99995))
 
         print(
             f"Scene Scale: {scene_scale}. Increase the position learning rate to {1.6e-4 * scene_scale}"
@@ -87,6 +88,7 @@ class SceneSplats:
             ("scales", torch.nn.Parameter(scales), 5e-3),
             ("quats", torch.nn.Parameter(quats), 1e-3),
             ("opacities", torch.nn.Parameter(opacities), 5e-2),
+            ("aux_opacities", torch.nn.Parameter(aux_opacities), 5e-2),
         ]
 
         ############### Initialie color #########################
@@ -193,9 +195,17 @@ class SceneSplats:
         return self._splats["opacities"]
 
     @property
+    def aux_opacities(self):
+        return self._splats["aux_opacities"]
+
+    @property
     def activated_opacities(self):
         return torch.sigmoid(self.opacities)
         # return self.opacities.clamp(0, 1)
+
+    @property
+    def activated_aux_opacities(self):
+        return torch.sigmoid(self.aux_opacities)
 
     @property
     def rgb_feature(self):
@@ -225,6 +235,7 @@ class SceneSplats:
         for i in range(shN_dim * color_channel_dim):  # shN
             l.append("f_rest_{}".format(i))
         l.append("opacity")
+        l.append("aux_opacity")
         for i in range(self.scales.shape[1]):
             l.append("scale_{}".format(i))
         for i in range(self.quats.shape[1]):
@@ -236,7 +247,7 @@ class SceneSplats:
 
     def save_ply(self, file_path: str):
         """
-        Save the model to a ply file. 
+        Save the model to a ply file.
         We made some changes to make it support both RGB and monochrome modality.
         """
 
@@ -272,6 +283,7 @@ class SceneSplats:
         rotation = self.quats.detach().cpu().numpy()  # (Nx4)
         # the saved opacities and scale are before activation
         opacities = self.opacities.detach().cpu().numpy()[..., None]
+        aux_opacities = self.aux_opacities.detach().cpu().numpy()[..., None]
         scale = self.scales.detach().cpu().numpy()
 
         dtype_full = [
@@ -282,7 +294,7 @@ class SceneSplats:
         ]
 
         attributes = np.concatenate(
-            (xyz, normals, color_sh0, color_shN, opacities, scale, rotation), axis=1
+            (xyz, normals, color_sh0, color_shN, opacities, aux_opacities, scale, rotation), axis=1
         )
 
         vertex_data = np.empty(xyz.shape[0], dtype=dtype_full)
@@ -299,6 +311,7 @@ class SceneSplats:
             ],
             dtype=[("color_format", "O"), ("color_channel", "i4"), ("sh_degree", "i4")],
         )
+
         metadata_element = PlyElement.describe(metadata_data, "metadata")
 
         plydata = PlyData([vertex_element, metadata_element], text=False)
@@ -343,6 +356,11 @@ class SceneSplats:
 
         opacities = np.asarray(plydata.elements[0]["opacity"])
 
+        if "aux_opacity" in plydata.elements[0].properties:
+            aux_opacities = np.asarray(plydata.elements[0]["aux_opacity"])
+        else:
+            aux_opacities = np.full_like(opacities, 10.0)  # for backward compatibility
+
         scale_names = [
             p.name
             for p in plydata.elements[0].properties
@@ -373,6 +391,11 @@ class SceneSplats:
             (
                 "opacities",
                 torch.nn.Parameter(torch.tensor(opacities, dtype=torch.float)),
+                5e-2,
+            ),
+            (
+                "aux_opacities",
+                torch.nn.Parameter(torch.tensor(aux_opacities, dtype=torch.float)),
                 5e-2,
             ),
         ]
@@ -791,6 +814,7 @@ class VanillaGSplat(L.LightningModule):
         sh_degree: int = 3,
         is_training: bool = False,
         rasterize_mode: Literal["classic", "antialiased"] = "classic",
+        dual_opacity_mode: bool = False,  # if false then standard rendering mode is used
     ):
         """
         Render the scene from a specified viewpoint_cam
@@ -832,6 +856,7 @@ class VanillaGSplat(L.LightningModule):
             sh_degree_to_use=sh_degree,
             camera_model=camera.camera_projection_model_gsplat,
             rasterize_mode=rasterize_mode,
+            dual_opacity_mode=dual_opacity_mode,
         )
 
         if self._render_motion_array(camera, is_training=is_training):
@@ -933,6 +958,7 @@ class VanillaGSplat(L.LightningModule):
         sh_degree_to_use: int = 3,
         camera_model: Literal["pinhole", "fisheye"] = "pinhole",
         rasterize_mode: Literal["classic", "antialiased"] = "classic",
+        dual_opacity_mode: bool = False,
     ):
         means = self.splats.means  # [N, 3]
         # rasterization does normalization internally
@@ -945,14 +971,20 @@ class VanillaGSplat(L.LightningModule):
                 self.splats.monochrome_feature, "b c (h 1) -> b c (h 3)", h=1
             )
 
+        if dual_opacity_mode:
+            opacities = self.splats.activated_opacities * self.splats.activated_aux_opacities
+        else:
+            opacities = self.splats.activated_opacities
+
         if min_depth > 0 and self.cfg.model.use_3d_smooth_filter:
             kernel_size_2d = 0.1  # the screen dilation kernel size in mip-splatting
             scales, opacities = self._apply_3d_depth_based_filter(
                 min_depth, focals=intrinsics[:, 0, 0]
             )
+            if dual_opacity_mode:
+                opacities = opacities * self.splats.activated_aux_opacities
         else:
             scales = self.splats.activated_scales  # [N, 3]
-            opacities = self.splats.activated_opacities  # [N,]
             kernel_size_2d = 0.3  # the default screen dilation kernel size in GS
 
         render_colors, render_alphas, info = rasterization(
@@ -1028,17 +1060,30 @@ class VanillaGSplat(L.LightningModule):
         train_cam = self.train_cameras[image_id]
         camera_name = train_cam.camera_name
 
-        renders = self.render(
+        renders_standard = self.render(
             train_cam,
             sh_degree=self.sh_degree_to_use,
             rasterize_mode=self.rasterization_mode,
             is_training=True,
+            dual_opacity_mode=False,
         )
-        train_cam.render_depth_min = renders["depth"].min().item()
+        image_standard = train_cam.expose_image(irradiance=renders_standard["render"], clamp=False)
 
-        image = train_cam.expose_image(irradiance=renders["render"], clamp=False)
+        renders_dual_opacity = self.render(
+            train_cam,
+            sh_degree=self.sh_degree_to_use,
+            rasterize_mode=self.rasterization_mode,
+            is_training=True,
+            dual_opacity_mode=True,
+        )
+        image_dual_opacity = train_cam.expose_image(irradiance=renders_dual_opacity["render"], clamp=False)
+
+        train_cam.render_depth_min = renders_standard["depth"].min().item()
+
+
 
         valid_mask = train_cam.valid_mask
+
 
         use_mask_loss = False
         if self.cfg.scene.mask_rendering:
@@ -1051,7 +1096,8 @@ class VanillaGSplat(L.LightningModule):
             # currently set to a random color does not work as good as setting it to black
             bmask = (mask < 0.5).expand_as(gt_image)
             gt_image[bmask] = 0
-            image[bmask] = 0
+            image_dual_opacity[bmask] = 0
+            image_standard[bmask] = 0
 
             use_mask_loss = True
         else:
@@ -1073,10 +1119,12 @@ class VanillaGSplat(L.LightningModule):
 
         pixel_loss_type = self.cfg.opt.pixel_loss
 
-        train_losses_categories = [pixel_loss_type, "dssim", "psnr"]
+        dual_losses_categories = [pixel_loss_type, "dssim", "psnr"]  # L_3DGS part of LColor
+        standard_losses_categories = ["l1"]  # L1 part of LColor
+
 
         if self.cfg.opt.l1_grad:
-            train_losses_categories.append("l1_grad")
+            dual_losses_categories.append("l1_grad")
 
         if train_cam.is_rgb:
             image_loss_func = self.rgb_image_loss
@@ -1090,25 +1138,38 @@ class VanillaGSplat(L.LightningModule):
             ), "mono image loss function cannot be None for Monochrome camera!"
 
         # clamp radiance value to the observed dynamic range
-        image = image.clamp(0, 1)
-        image_losses = image_loss_func(
-            image, gt_image, losses=train_losses_categories, valid_mask=valid_mask
+        image_dual_clamped = image_dual_opacity.clamp(0, 1)
+        image_standard_clamped = image_standard.clamp(0, 1)
+
+        image_losses_dual = image_loss_func(
+            image_dual_clamped, gt_image, losses=dual_losses_categories, valid_mask=valid_mask
         )
 
-        loss = (
-            self.cfg.opt.pixel_lambda * image_losses[pixel_loss_type]
-            + 0.2 * image_losses["dssim"]
+        image_losses_standard = image_loss_func(
+            image_standard_clamped, gt_image, losses=standard_losses_categories, valid_mask=valid_mask
         )
-        if "l1_grad" in train_losses_categories:
-            loss += self.cfg.opt.l1_grad_lamda * image_losses["l1_grad"]
 
-        logs = {f"train/{camera_name}/image_loss_total": loss}
-        for loss_type in train_losses_categories:
-            logs[f"train/{camera_name}/{loss_type}"] = image_losses[loss_type]
+
+        # L_color = L_3DGS(C_o, C_gt) + L_1(C_s, C_gt)
+        l_color = (
+            self.cfg.opt.pixel_lambda * image_losses_dual[pixel_loss_type]
+            + 0.2 * image_losses_dual["dssim"]
+            + image_losses_standard['l1']
+        )
+        loss = l_color
+
+        if "l1_grad" in dual_losses_categories:
+            loss += self.cfg.opt.l1_grad_lamda * image_losses_dual["l1_grad"]
+
+        logs = {f"train/{camera_name}/l_color": l_color,
+                f"train/{camera_name}/l1_standard": image_losses_standard['l1']}
+
+        for loss_type in dual_losses_categories:
+            logs[f"train/{camera_name}/{loss_type}"] = image_losses_dual[loss_type]
 
         if self.cfg.opt.depth_loss:
             depthloss = calculate_inverse_depth_loss(
-                render_depth=renders["depth"] / self.scene_scale,
+                render_depth=renders_standard["depth"] / self.scene_scale,
                 sparse_point2d=batch["sparse_point2d"].to(self.device),
                 sparse_inv_depth=batch["sparse_inv_depth"].to(self.device),
                 sparse_inv_distance_std=batch["sparse_inv_distance_std"].to(
@@ -1118,13 +1179,18 @@ class VanillaGSplat(L.LightningModule):
                 huber_delta=0.5,
             )
             depth_lambda = self.cfg.opt.depth_lambda
-            loss += depth_lambda * depthloss["huber"]
-            logs["train/depth_loss_huber"] = depthloss
+            l_consis = depth_lambda * depthloss["huber"]
+            loss += l_consis
+            logs["train/depth_consistency_loss"] = l_consis
 
         if self.cfg.opt.opacity_reg > 0:
             loss_opacity_reg = torch.abs(self.splats.activated_opacities).mean()
             loss += self.cfg.opt.opacity_reg * loss_opacity_reg
             logs["train/opacity_reg_mean"] = loss_opacity_reg
+
+            loss_aux_opacity_reg = torch.abs(self.splats.activated_aux_opacities).mean()
+            loss += self.cfg.opt.opacity_reg * loss_aux_opacity_reg
+            logs["train/aux_opacity_reg_mean"] = loss_aux_opacity_reg
 
         if self.cfg.opt.scale_reg > 0:
             loss_scale_reg = torch.abs(self.splats.activated_scales).mean()
@@ -1133,7 +1199,7 @@ class VanillaGSplat(L.LightningModule):
 
         if use_mask_loss:
             # enforce the background alphas to be zero
-            maskloss = renders["alphas"][mask < 0.5].mean()
+            maskloss = renders_standard["alphas"][mask < 0.5].mean()
             logs["train/mask_loss"] = maskloss
             loss += maskloss
 
@@ -1147,12 +1213,12 @@ class VanillaGSplat(L.LightningModule):
             optimizers=self.manual_opt,
             state=self.strategy_state,
             step=self.train_iter,
-            info=renders["info"],
+            info=renders_dual_opacity["info"],
         )
 
         to_return = {
             "loss": loss,
-            "render": image,
+            "render": image_dual_opacity,
         }
 
         # in manual optimization mode
@@ -1164,7 +1230,7 @@ class VanillaGSplat(L.LightningModule):
                 optimizers=self.manual_opt,
                 state=self.strategy_state,
                 step=self.train_iter,
-                info=renders["info"],
+                info=renders_dual_opacity["info"],
                 packed=self.cfg.opt.packed,
             )
         elif isinstance(self.densification_strategy, MCMCStrategy):
@@ -1173,7 +1239,7 @@ class VanillaGSplat(L.LightningModule):
                 optimizers=self.manual_opt,
                 state=self.strategy_state,
                 step=self.train_iter,
-                info=renders["info"],
+                info=renders_dual_opacity["info"],
                 lr=self.schedulers[0].get_last_lr()[0],
             )
 
@@ -1221,7 +1287,7 @@ class VanillaGSplat(L.LightningModule):
         image_height, image_width = gt_image.shape[-2:]
 
         with torch.no_grad():
-            renders = self.render(camera)
+            renders = self.render(camera, dual_opacity_mode=True)
 
         image = renders["render"][0]
         camera.render_depth_min = renders["depth"].min().item()

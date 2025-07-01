@@ -74,6 +74,8 @@ def to_aria_image_frame(
     def process_raw_data(frame_i: int, camera_label: str):
         stream_id = provider.get_stream_id_from_label(camera_label)
 
+        # print(f"--- Attempting to process frame index: {frame_i} for {camera_label} ---")
+
         sensor_data = provider.get_sensor_data_by_index(stream_id, frame_i)
         image_data, image_record = sensor_data.image_data_and_record()
 
@@ -101,9 +103,13 @@ def to_aria_image_frame(
         exposure_duration_s = image_record.exposure_duration
         gain = image_record.gain
 
+        # print(f"Image timestamp (ns): {capture_time_middle}")
+
         # replace this the interpolation function.
         pose_info = interpolate_aria_pose(closed_loop_traj, capture_time_middle)
         if pose_info is None:
+            #     print(
+            #         f"!!! FAILED: Could not find a matching pose in trajectory file for timestamp {capture_time_middle}. Skipping frame.")
             return None
         # pose_info = get_nearest_pose(closed_loop_traj, capture_time_middle)
         pose_read_start_info = interpolate_aria_pose(

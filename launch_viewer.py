@@ -11,6 +11,7 @@ import os
 import time
 from pathlib import Path
 from typing import List, Tuple
+import time, types, imageio.v2 as imageio
 
 import einops
 import hydra
@@ -18,6 +19,7 @@ import hydra
 import numpy as np
 import torch
 import viser
+import viser.transforms as vtf
 from natsort import natsorted
 from omegaconf import DictConfig, OmegaConf
 
@@ -27,13 +29,14 @@ from utils.io import load_from_model_path
 
 from utils.render_utils import apply_turbo_colormap, depth_to_normal
 from viewer import ViewerCustomized
+from scipy.spatial.transform import Rotation, Slerp
 
 
 def scan_avail_iters(model_path: Path, ply_file: str = "point_cloud.ply"):
     # Scan and get all the checkpoints
     all_paths = glob.glob(str(model_path / "point_cloud" / "iteration_*" / ply_file))
     all_paths = natsorted(all_paths)
-    iter_names = [str(p)[len(str(model_path)) + 1 :] for p in all_paths]
+    iter_names = [str(p)[len(str(model_path)) + 1:] for p in all_paths]
     return iter_names
 
 
@@ -50,11 +53,11 @@ def read_cameras_json(cameras_json_path: str):
 
 
 class RenderViewer(ViewerCustomized):
-
     up_direction = np.asarray([0.0, 0.0, 1.0])
 
     ply_names: List[str] = None
     real_cameras: List[Camera] = None
+    saved_camera_poses: List[Tuple[np.ndarray, float]] = None
 
     radiance_weight: float = 1.0
 
@@ -68,9 +71,9 @@ class RenderViewer(ViewerCustomized):
     camera_modality = "rgb"
 
     def __init__(
-        self,
-        cfg: DictConfig,
-        server: viser.ViserServer,
+            self,
+            cfg: DictConfig,
+            server: viser.ViserServer,
     ):
         """
         cfg: the configuration file
@@ -85,6 +88,9 @@ class RenderViewer(ViewerCustomized):
         self.show_cameras = cfg.show_cameras
         self.reorient = cfg.reorient
         self._color_format = cfg.color_format
+
+        # Initialize list to store saved camera poses
+        self.saved_camera_poses = []
 
         self.visualize_raw = cfg.load_raw_ply
         if self.visualize_raw:
@@ -138,7 +144,7 @@ class RenderViewer(ViewerCustomized):
                 model_initialized = True
 
             valid_model_paths.append(p)
-            model_names.append(str(p)[len(self.model_root) :])
+            model_names.append(str(p)[len(self.model_root):])
 
         if len(valid_model_paths) < 1:
             raise RuntimeError(
@@ -290,11 +296,186 @@ class RenderViewer(ViewerCustomized):
 
         if render_foreground:
             pad = (image_width - render_width) // 2
-            render_image[:, pad : pad + render_width] = image_vis.cpu().numpy()
+            render_image[:, pad: pad + render_width] = image_vis.cpu().numpy()
         else:
             render_image = image_vis.cpu().numpy()
 
         return render_image
+
+    def add_camera_trajectory_folder(self):
+        with self.server.gui.add_folder("Camera Trajectory"):
+            self.saved_camera_count_text = self.server.gui.add_text(
+                label="Saved Poses", initial_value="0", disabled=True
+            )
+            save_camera_button = self.server.gui.add_button(
+                "Save Camera Pose",
+                icon=viser.Icon.PLUS,
+            )
+            play_button = self.server.gui.add_button(
+                "Play Trajectory",
+                icon=viser.Icon.PLAYER_PLAY,
+            )
+            clear_button = self.server.gui.add_button(
+                "Clear Trajectory",
+                icon=viser.Icon.TRASH,
+            )
+            self.trajectory_duration_slider = self.server.gui.add_slider(
+                "Traj. Duration (sec)", min=1, max=30, step=1, initial_value=5
+            )
+
+        @save_camera_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            client = event.client
+            if client is None:
+                return
+
+            R = vtf.SO3.from_quaternion_xyzw(
+                np.array(
+                    [
+                        client.camera.wxyz[1],
+                        client.camera.wxyz[2],
+                        client.camera.wxyz[3],
+                        client.camera.wxyz[0],
+                    ]
+                )
+            ).as_matrix()
+
+            t = client.camera.position
+
+            c2w = np.eye(4)
+            c2w[:3, :3] = R
+            c2w[:3, 3] = t
+
+            self.saved_camera_poses.append((c2w, client.camera.fov))
+            self.saved_camera_count_text.value = str(len(self.saved_camera_poses))
+
+        @clear_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            self.saved_camera_poses.clear()
+            self.saved_camera_count_text.value = str(len(self.saved_camera_poses))
+
+        @play_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            client = event.client
+            if client is None or len(self.saved_camera_poses) < 2:
+                return
+
+            play_button.disabled = True
+            clear_button.disabled = True
+            save_camera_button.disabled = True
+
+            try:
+                for i in range(len(self.saved_camera_poses) - 1):
+                    start_c2w, start_fov = self.saved_camera_poses[i]
+                    end_c2w, end_fov = self.saved_camera_poses[i + 1]
+
+                    start_R = start_c2w[:3, :3]
+                    end_R = end_c2w[:3, :3]
+                    start_t = start_c2w[:3, 3]
+                    end_t = end_c2w[:3, 3]
+
+                    key_rotations = Rotation.from_matrix([start_R, end_R])
+                    slerp = Slerp([0, 1], key_rotations)
+
+                    num_steps = int(self.trajectory_duration_slider.value * 60 / (len(self.saved_camera_poses) - 1))
+                    if num_steps == 0:
+                        num_steps = 1
+
+                    for j in range(num_steps + 1):
+                        alpha = j / num_steps
+
+                        # interpolate pose
+                        interp_R = slerp([alpha]).as_matrix()[0]  # 3×3
+                        interp_t = (1 - alpha) * start_t + alpha * end_t
+                        interp_fov = (1 - alpha) * start_fov + alpha * end_fov
+
+                        # Convert rotation matrix to quaternion
+                        quat_xyzw = Rotation.from_matrix(interp_R).as_quat()  # (x, y, z, w)
+                        wxyz = np.array([quat_xyzw[3], *quat_xyzw[:3]])  # (w, x, y, z)
+
+                        # Send all camera fields in one atomic update to avoid flicker
+                        with client.atomic():
+                            client.camera.wxyz = wxyz
+                            client.camera.position = interp_t
+                            client.camera.fov = interp_fov
+
+                        client.flush()
+                        time.sleep(1.0 / 60.0)
+
+            finally:
+                play_button.disabled = False
+                clear_button.disabled = False
+                save_camera_button.disabled = False
+
+        record_button = self.server.gui.add_button(
+            "Record MP4",
+            icon=viser.Icon.VIDEO,
+        )
+
+        @record_button.on_click
+        def _(event: viser.GuiEvent) -> None:
+            client = event.client
+            if client is None or len(self.saved_camera_poses) < 2:
+                return
+
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            out_path = f"trajectory_{ts}.mp4"
+            fps = 60
+            if hasattr(client.camera, "image_width"):
+                width = client.camera.image_width
+                height = client.camera.image_height
+            else:
+                height = 720
+                aspect = getattr(client.camera, "aspect", 16 / 9)
+                width = int(height * aspect)
+
+            writer = imageio.get_writer(
+                out_path,
+                fps=fps,
+                codec="libx264",
+                quality=8,
+            )
+
+            try:
+                for i in range(len(self.saved_camera_poses) - 1):
+                    start_c2w, start_fov = self.saved_camera_poses[i]
+                    end_c2w, end_fov = self.saved_camera_poses[i + 1]
+
+                    start_R, start_t = start_c2w[:3, :3], start_c2w[:3, 3]
+                    end_R, end_t = end_c2w[:3, :3], end_c2w[:3, 3]
+                    key_rots = Rotation.from_matrix([start_R, end_R])
+                    slerp = Slerp([0, 1], key_rots)
+
+                    num_steps = int(self.trajectory_duration_slider.value * fps /
+                                    (len(self.saved_camera_poses) - 1))
+                    num_steps = max(1, num_steps)
+
+                    for j in range(num_steps + 1):
+                        α = j / num_steps
+                        R = slerp([α]).as_matrix()[0]
+                        t = (1 - α) * start_t + α * end_t
+                        fov = (1 - α) * start_fov + α * end_fov
+
+                        quat_xyzw = Rotation.from_matrix(R).as_quat()
+                        wxyz = np.array([quat_xyzw[3], *quat_xyzw[:3]])
+
+                        with client.atomic():
+                            client.camera.wxyz = wxyz
+                            client.camera.position = t
+                            client.camera.fov = fov
+
+                        stub = types.SimpleNamespace(c2w=np.linalg.inv(
+                            np.column_stack((R, t)).astype(float)
+                            .tolist() + [[0, 0, 0, 1]]
+                        ), fov=fov)
+                        frame = self.viewer_render_fn(stub, (width, height))
+                        writer.append_data((frame * 255).astype(np.uint8))
+
+                        time.sleep(1.0 / fps)
+
+            finally:
+                writer.close()
+                print(f"Saved trajectory to {out_path}")
 
     def generate_guis(self):
         """
@@ -365,7 +546,8 @@ class RenderViewer(ViewerCustomized):
                     self.real_cameras, slider_name="Observations"
                 )
 
-            # self.add_capture_save_folder(self.server)
+            self.add_camera_trajectory_folder()
+
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="viewer")
